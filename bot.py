@@ -29,31 +29,29 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "BOT_TOKEN is missing.\n"
-        "Add BOT_TOKEN to your .env file."
+        "BOT_TOKEN is missing. "
+        "Add it to your .env file or Render environment variables."
     )
 
 PORT = int(os.getenv("PORT", "10000"))
 
-# Render automatically provides this.
-# Locally this will be empty.
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 
 # =========================================================
-# FIND FFMPEG
+# FFMPEG
 # =========================================================
 
 def find_ffmpeg():
 
-    # First check normal PATH
+    # Normal PATH
     ffmpeg = shutil.which("ffmpeg")
 
     if ffmpeg:
         print(f"FFmpeg found: {ffmpeg}")
         return ffmpeg
 
-    # Check WinGet installation
+    # Windows WinGet
     local_app_data = os.environ.get(
         "LOCALAPPDATA",
         ""
@@ -90,20 +88,13 @@ def find_ffmpeg():
 FFMPEG = find_ffmpeg()
 
 if not FFMPEG:
-
-    print(
-        "WARNING: FFmpeg was not found."
-    )
-
+    print("WARNING: FFmpeg was not found.")
 else:
-
-    print(
-        f"Using FFmpeg: {FFMPEG}"
-    )
+    print(f"Using FFmpeg: {FFMPEG}")
 
 
 # =========================================================
-# FIND FFPROBE
+# FFPROBE
 # =========================================================
 
 def find_ffprobe():
@@ -115,10 +106,8 @@ def find_ffprobe():
 
     if FFMPEG:
 
-        ffmpeg_path = Path(FFMPEG)
-
         possible = (
-            ffmpeg_path.parent
+            Path(FFMPEG).parent
             / "ffprobe.exe"
         )
 
@@ -132,7 +121,7 @@ FFPROBE = find_ffprobe()
 
 
 # =========================================================
-# TELEGRAM REQUEST SETTINGS
+# TELEGRAM REQUEST
 # =========================================================
 
 request = HTTPXRequest(
@@ -144,7 +133,7 @@ request = HTTPXRequest(
 
 
 # =========================================================
-# TELEGRAM APPLICATION
+# APPLICATION
 # =========================================================
 
 application = (
@@ -157,6 +146,58 @@ application = (
 
 
 # =========================================================
+# TRACK CURRENT JOBS
+#
+# Prevents the same Telegram update from being processed
+# twice.
+# =========================================================
+
+active_jobs = set()
+
+
+# =========================================================
+# SAFE TELEGRAM MESSAGE EDIT
+# =========================================================
+
+async def safe_edit(message, text):
+
+    try:
+
+        await message.edit_text(text)
+
+        return True
+
+    except Exception as error:
+
+        print(
+            "Telegram message update failed:",
+            repr(error)
+        )
+
+        return False
+
+
+# =========================================================
+# SAFE DELETE
+# =========================================================
+
+async def safe_delete(message):
+
+    try:
+
+        await message.delete()
+
+    except Exception as error:
+
+        # This should NEVER make a successful conversion
+        # look like a failed conversion.
+        print(
+            "Could not delete status message:",
+            repr(error)
+        )
+
+
+# =========================================================
 # /START
 # =========================================================
 
@@ -164,6 +205,9 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
+    if not update.message:
+        return
 
     await update.message.reply_text(
         "👋 Welcome to Snapchat Preview Maker!\n\n"
@@ -180,12 +224,10 @@ async def start(
 
 
 # =========================================================
-# GET VIDEO DURATION
+# VIDEO DURATION
 # =========================================================
 
-async def get_video_duration(
-    input_path
-):
+async def get_video_duration(input_path):
 
     if not FFPROBE:
         return 8.0
@@ -200,24 +242,25 @@ async def get_video_duration(
         "format=duration",
 
         "-of",
-        "default=noprint_wrappers=1:"
-        "nokey=1",
+        "default=noprint_wrappers=1:nokey=1",
 
         str(input_path),
     ]
 
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    stdout, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        return 8.0
-
     try:
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+
+            stdout=asyncio.subprocess.PIPE,
+
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        stdout, _ = await process.communicate()
+
+        if process.returncode != 0:
+            return 8.0
 
         duration = float(
             stdout.decode().strip()
@@ -234,7 +277,28 @@ async def get_video_duration(
 
 
 # =========================================================
-# UPDATE PROGRESS MESSAGE
+# PROGRESS BAR
+# =========================================================
+
+def make_progress_bar(percent):
+
+    percent = max(
+        0,
+        min(100, int(percent))
+    )
+
+    filled = int(
+        percent / 10
+    )
+
+    return (
+        "█" * filled
+        + "░" * (10 - filled)
+    )
+
+
+# =========================================================
+# UPDATE PROGRESS
 # =========================================================
 
 async def update_progress(
@@ -245,7 +309,7 @@ async def update_progress(
 
     now = time.monotonic()
 
-    # Don't hammer Telegram with messages.
+    # Update at most every 1.5 seconds
     if (
         now - last_update[0] < 1.5
         and percent < 100
@@ -257,33 +321,26 @@ async def update_progress(
         min(100, int(percent))
     )
 
-    blocks = int(
-        percent / 10
+    bar = make_progress_bar(
+        percent
     )
 
-    progress_bar = (
-        "█" * blocks
-        + "░" * (10 - blocks)
+    text = (
+        "⚙️ Converting video...\n\n"
+
+        f"{bar} {percent}%\n\n"
+
+        "📱 720 × 1280\n"
+        "📐 9:16\n"
+        "🎬 Maximum 8 seconds"
     )
 
-    try:
-
-        await status.edit_text(
-            "⚙️ Converting video...\n\n"
-            f"{progress_bar} {percent}%\n\n"
-            "📱 720 × 1280\n"
-            "📐 9:16\n"
-            "🎬 Maximum 8 seconds"
-        )
+    if await safe_edit(
+        status,
+        text
+    ):
 
         last_update[0] = now
-
-    except Exception as error:
-
-        print(
-            "Progress update error:",
-            repr(error)
-        )
 
 
 # =========================================================
@@ -300,11 +357,37 @@ async def process_video(
     if not message or not message.video:
         return
 
+    # =====================================================
+    # DUPLICATE PROTECTION
+    # =====================================================
+
+    job_id = (
+        update.update_id
+        if update.update_id is not None
+        else message.message_id
+    )
+
+    if job_id in active_jobs:
+
+        print(
+            f"Ignoring duplicate update: {job_id}"
+        )
+
+        return
+
+    active_jobs.add(job_id)
+
+    # =====================================================
+    # FFMPEG CHECK
+    # =====================================================
+
     if not FFMPEG:
 
         await message.reply_text(
             "❌ FFmpeg is not available."
         )
+
+        active_jobs.discard(job_id)
 
         return
 
@@ -322,12 +405,22 @@ async def process_video(
         / f"snap_output_{message.message_id}.mp4"
     )
 
-    status = await message.reply_text(
-        "📥 Downloading video...\n\n"
-        "0%"
-    )
+    status = None
+
+    # This becomes True ONLY after the final video
+    # has been successfully handed to Telegram.
+    video_sent = False
 
     try:
+
+        # =================================================
+        # STATUS
+        # =================================================
+
+        status = await message.reply_text(
+            "📥 Downloading video...\n\n"
+            "0%"
+        )
 
         # =================================================
         # DOWNLOAD
@@ -341,8 +434,12 @@ async def process_video(
             custom_path=str(input_path)
         )
 
+        print(
+            "Video downloaded successfully."
+        )
+
         # =================================================
-        # GET DURATION
+        # DURATION
         # =================================================
 
         duration = await get_video_duration(
@@ -350,12 +447,13 @@ async def process_video(
         )
 
         print(
-            f"Video duration used: {duration:.2f}s"
+            f"Processing duration: {duration:.2f}s"
         )
 
-        await status.edit_text(
+        await safe_edit(
+            status,
             "📥 Download complete!\n\n"
-            "⚙️ Preparing conversion...\n"
+            "⚙️ Preparing conversion...\n\n"
             "0%"
         )
 
@@ -376,7 +474,7 @@ async def process_video(
             "-t",
             "8",
 
-            # 9:16 / 720x1280
+            # 720 x 1280 / 9:16
             "-vf",
             (
                 "scale=720:1280:"
@@ -401,7 +499,7 @@ async def process_video(
             "-pix_fmt",
             "yuv420p",
 
-            # Keep comfortably under 32 MB
+            # Keep file comfortably under 32 MB
             "-b:v",
             "2200k",
 
@@ -421,11 +519,11 @@ async def process_video(
             "-ar",
             "48000",
 
-            # Fast-start MP4
+            # Web-friendly MP4
             "-movflags",
             "+faststart",
 
-            # Progress output
+            # Machine-readable progress
             "-progress",
             "pipe:1",
 
@@ -438,11 +536,8 @@ async def process_video(
             "Running FFmpeg..."
         )
 
-        print(
-            " ".join(command)
-        )
-
         process = await asyncio.create_subprocess_exec(
+
             *command,
 
             stdout=asyncio.subprocess.PIPE,
@@ -450,11 +545,11 @@ async def process_video(
             stderr=asyncio.subprocess.PIPE,
         )
 
+        last_update = [0]
+
         # =================================================
         # READ FFMPEG PROGRESS
         # =================================================
-
-        last_update = [0]
 
         while True:
 
@@ -489,7 +584,6 @@ async def process_video(
                         / duration
                     ) * 100
 
-                    # Never exceed 99% before FFmpeg finishes
                     percent = min(
                         percent,
                         99
@@ -501,11 +595,15 @@ async def process_video(
                         last_update
                     )
 
-                except Exception:
-                    pass
+                except Exception as error:
+
+                    print(
+                        "Progress parsing error:",
+                        repr(error)
+                    )
 
         # =================================================
-        # WAIT FOR FFMPEG
+        # GET FFMPEG RESULT
         # =================================================
 
         stderr = await process.stderr.read()
@@ -514,7 +612,7 @@ async def process_video(
 
         if process.returncode != 0:
 
-            error = stderr.decode(
+            error_text = stderr.decode(
                 errors="ignore"
             )
 
@@ -522,9 +620,12 @@ async def process_video(
                 "FFMPEG ERROR:"
             )
 
-            print(error)
+            print(
+                error_text
+            )
 
-            await status.edit_text(
+            await safe_edit(
+                status,
                 "❌ Conversion failed.\n\n"
                 "Please try another video."
             )
@@ -537,8 +638,10 @@ async def process_video(
 
         if not output_path.exists():
 
-            await status.edit_text(
-                "❌ FFmpeg did not create the output."
+            await safe_edit(
+                status,
+                "❌ Conversion failed.\n\n"
+                "FFmpeg did not create the output."
             )
 
             return
@@ -547,10 +650,13 @@ async def process_video(
         # 100%
         # =================================================
 
-        await update_progress(
+        await safe_edit(
             status,
-            100,
-            [0]
+            "⚙️ Converting video...\n\n"
+            "██████████ 100%\n\n"
+            "📱 720 × 1280\n"
+            "📐 9:16\n"
+            "🎬 Maximum 8 seconds"
         )
 
         await asyncio.sleep(
@@ -570,15 +676,12 @@ async def process_video(
             f"Output size: {size_mb:.2f} MB"
         )
 
-        # =================================================
-        # SIZE LIMIT
-        # =================================================
-
         if size_mb > 32:
 
-            await status.edit_text(
-                f"⚠️ Conversion complete, "
-                f"but the file is {size_mb:.1f} MB.\n\n"
+            await safe_edit(
+                status,
+                f"⚠️ Conversion complete, but "
+                f"the file is {size_mb:.1f} MB.\n\n"
                 "That's above the 32 MB limit."
             )
 
@@ -588,11 +691,12 @@ async def process_video(
         # UPLOAD
         # =================================================
 
-        await status.edit_text(
+        await safe_edit(
+            status,
             "✅ Conversion complete!\n\n"
             "100%\n\n"
             f"📦 {size_mb:.1f} MB\n"
-            "⬆️ Uploading to Telegram..."
+            "⬆️ Uploading..."
         )
 
         try:
@@ -608,6 +712,7 @@ async def process_video(
 
                     caption=(
                         "✅ Snapchat Preview Ready\n\n"
+
                         "🎬 8 seconds\n"
                         "📱 720 × 1280\n"
                         "📐 9:16\n"
@@ -621,8 +726,16 @@ async def process_video(
                     write_timeout=180,
 
                     connect_timeout=30,
-
                 )
+
+            # IMPORTANT:
+            # Only mark success AFTER Telegram accepts
+            # the video.
+            video_sent = True
+
+            print(
+                "Video successfully sent to Telegram."
+            )
 
         except Exception as upload_error:
 
@@ -631,11 +744,10 @@ async def process_video(
                 repr(upload_error)
             )
 
-            # If Telegram timed out after receiving the
-            # upload, don't falsely claim conversion failed.
-            await status.edit_text(
-                "⚠️ Video was converted successfully,\n"
-                "but Telegram timed out while uploading it.\n\n"
+            await safe_edit(
+                status,
+                "⚠️ Conversion completed, but "
+                "Telegram timed out while uploading.\n\n"
                 f"File size: {size_mb:.1f} MB"
             )
 
@@ -645,13 +757,24 @@ async def process_video(
         # SUCCESS
         # =================================================
 
-        try:
+        if video_sent:
 
-            await status.delete()
+            # Deleting the status message is OPTIONAL.
+            # If Telegram times out here, it must NOT turn
+            # the successful conversion into an error.
+            await safe_delete(
+                status
+            )
 
-        except Exception:
+            print(
+                "JOB COMPLETED SUCCESSFULLY."
+            )
 
-            pass
+            return
+
+    # =====================================================
+    # GENERAL ERROR
+    # =====================================================
 
     except Exception as error:
 
@@ -663,18 +786,31 @@ async def process_video(
             repr(error)
         )
 
-        try:
+        # CRITICAL:
+        # If the video was already sent successfully,
+        # NEVER send "conversion failed".
+        if video_sent:
 
-            await status.edit_text(
+            print(
+                "Ignoring error because video "
+                "was already successfully sent."
+            )
+
+            return
+
+        if status:
+
+            await safe_edit(
+                status,
                 "❌ Something went wrong "
                 "while processing the video."
             )
 
-        except Exception:
-
-            pass
-
     finally:
+
+        # =================================================
+        # CLEANUP
+        # =================================================
 
         try:
 
@@ -683,7 +819,6 @@ async def process_video(
             )
 
         except Exception:
-
             pass
 
         try:
@@ -693,8 +828,11 @@ async def process_video(
             )
 
         except Exception:
-
             pass
+
+        active_jobs.discard(
+            job_id
+        )
 
 
 # =========================================================
@@ -709,7 +847,7 @@ async def health(request):
 
 
 # =========================================================
-# TELEGRAM WEBHOOK
+# WEBHOOK
 # =========================================================
 
 async def telegram_webhook(request):
@@ -723,8 +861,18 @@ async def telegram_webhook(request):
             application.bot
         )
 
-        await application.process_update(
-            update
+        # IMPORTANT:
+        #
+        # Do NOT wait for FFmpeg here.
+        #
+        # Telegram needs the webhook response quickly.
+        # Processing the video in the background prevents
+        # Telegram from retrying the same update.
+        #
+        asyncio.create_task(
+            application.process_update(
+                update
+            )
         )
 
         return web.Response(
@@ -745,7 +893,7 @@ async def telegram_webhook(request):
 
 
 # =========================================================
-# RENDER MODE
+# RENDER
 # =========================================================
 
 async def run_render():
@@ -779,6 +927,10 @@ async def run_render():
     print(
         "Telegram webhook configured."
     )
+
+    # =====================================================
+    # HTTP SERVER
+    # =====================================================
 
     app = web.Application()
 
@@ -815,6 +967,7 @@ async def run_render():
         f"Server running on port {PORT}"
     )
 
+    # Keep alive
     while True:
 
         await asyncio.sleep(
