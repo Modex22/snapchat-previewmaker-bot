@@ -9,12 +9,7 @@ from pathlib import Path
 
 from aiohttp import web
 from dotenv import load_dotenv
-
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -32,14 +27,10 @@ from telegram.request import HTTPXRequest
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.getenv("PORT", "10000"))
+PORT = int(os.getenv("PORT", "8080"))
 
-# Railway/Render can provide a public URL.
-PUBLIC_URL = (
-    os.getenv("RAILWAY_PUBLIC_DOMAIN")
-    or os.getenv("RENDER_EXTERNAL_URL")
-    or ""
-).rstrip("/")
+# Railway public domain
+PUBLIC_URL = "https://snapchat-previewmaker-bot-production.up.railway.app"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -55,7 +46,6 @@ def find_ffmpeg():
     if path:
         return path
 
-    # Windows WinGet fallback
     base = Path(
         r"C:\Users\USER\AppData\Local\Microsoft\WinGet\Packages"
     )
@@ -119,7 +109,6 @@ application = (
 # ============================================================
 
 video_queue = asyncio.Queue()
-
 queue_worker_task = None
 
 
@@ -136,7 +125,6 @@ class VideoJob:
 # ============================================================
 
 seen_updates = OrderedDict()
-
 MAX_SEEN_UPDATES = 5000
 
 
@@ -154,56 +142,53 @@ def claim_update(update_id: int) -> bool:
 
 
 # ============================================================
-# MENU
+# TELEGRAM COMMAND MENU
 # ============================================================
 
-MAIN_MENU = ReplyKeyboardMarkup(
-    [
+async def setup_commands():
+
+    await application.bot.set_my_commands(
         [
-            KeyboardButton("📤 Upload Video"),
-            KeyboardButton("📋 Queue"),
-        ],
-        [
-            KeyboardButton("ℹ️ Help"),
-        ],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-)
-
-
-# ============================================================
-# SAFE TELEGRAM HELPERS
-# ============================================================
-
-async def safe_edit(message, text):
-
-    try:
-        await message.edit_text(text)
-    except Exception as e:
-        print(f"Could not edit message: {e}")
-
-
-async def safe_delete(message):
-
-    try:
-        await message.delete()
-    except Exception as e:
-        print(f"Could not delete message: {e}")
+            BotCommand(
+                "start",
+                "Bot main menu"
+            ),
+            BotCommand(
+                "help",
+                "How to use the bot"
+            ),
+            BotCommand(
+                "queue",
+                "Check processing queue"
+            ),
+        ]
+    )
 
 
 # ============================================================
 # PROGRESS BAR
 # ============================================================
 
-def progress_bar(percent: int, width: int = 10):
+def progress_bar(
+    percent: int,
+    width: int = 10
+):
 
-    percent = max(0, min(100, percent))
+    percent = max(
+        0,
+        min(100, percent)
+    )
 
-    filled = int(width * percent / 100)
+    filled = int(
+        width * percent / 100
+    )
+
     empty = width - filled
 
-    return "█" * filled + "░" * empty
+    return (
+        "█" * filled
+        + "░" * empty
+    )
 
 
 # ============================================================
@@ -212,20 +197,19 @@ def progress_bar(percent: int, width: int = 10):
 
 async def start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     await update.message.reply_text(
         "🎬 Snapchat Preview Maker\n\n"
-        "Convert your videos into Snapchat-ready "
-        "preview videos.\n\n"
+        "Send me a video and I'll convert it to:\n\n"
         "📐 720 × 1280\n"
         "📱 9:16\n"
         "⏱ Maximum 8 seconds\n"
         "🎞 MP4 / H.264\n"
         "📦 Under 32 MB\n\n"
-        "Send a video whenever you're ready.",
-        reply_markup=MAIN_MENU,
+        "You can send multiple videos.\n"
+        "They'll be processed one at a time."
     )
 
 
@@ -235,42 +219,21 @@ async def start(
 
 async def help_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     await update.message.reply_text(
         "ℹ️ How it works\n\n"
-        "1️⃣ Tap 📤 Upload Video\n"
-        "2️⃣ Send your video\n"
-        "3️⃣ The video is added to the queue\n"
-        "4️⃣ It is converted automatically\n"
-        "5️⃣ Your Snapchat-ready video is sent back\n\n"
-        "You can send multiple videos at once.\n"
-        "They will be processed in order.\n\n"
+        "1. Send a video.\n"
+        "2. It is added to the processing queue.\n"
+        "3. Videos are processed one at a time.\n"
+        "4. Your converted video is sent back automatically.\n\n"
         "Output:\n"
         "• 720 × 1280\n"
         "• 9:16\n"
         "• Maximum 8 seconds\n"
         "• MP4 / H.264\n"
-        "• Under 32 MB",
-        reply_markup=MAIN_MENU,
-    )
-
-
-# ============================================================
-# UPLOAD BUTTON
-# ============================================================
-
-async def upload_button(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.message.reply_text(
-        "📤 Send your video now.\n\n"
-        "You can also send multiple videos — "
-        "I'll process them one at a time.",
-        reply_markup=MAIN_MENU,
+        "• Under 32 MB"
     )
 
 
@@ -280,54 +243,29 @@ async def upload_button(
 
 async def queue_status(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     size = video_queue.qsize()
 
     if size == 0:
 
-        await update.message.reply_text(
+        text = (
             "📋 Queue\n\n"
-            "✅ No videos are waiting.",
-            reply_markup=MAIN_MENU,
+            "✅ No videos are waiting."
         )
 
     else:
 
-        await update.message.reply_text(
+        text = (
             "📋 Queue\n\n"
             f"⏳ {size} video(s) waiting.\n\n"
-            "Videos are processed one at a time.",
-            reply_markup=MAIN_MENU,
+            "Videos are processed one at a time."
         )
 
-
-# ============================================================
-# BUTTON TEXT HANDLER
-# ============================================================
-
-async def menu_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not update.message:
-        return
-
-    text = update.message.text
-
-    if text == "📤 Upload Video":
-
-        await upload_button(update, context)
-
-    elif text == "📋 Queue":
-
-        await queue_status(update, context)
-
-    elif text == "ℹ️ Help":
-
-        await help_command(update, context)
+    await update.message.reply_text(
+        text
+    )
 
 
 # ============================================================
@@ -336,23 +274,19 @@ async def menu_handler(
 
 async def handle_video(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    # --------------------------------------------------------
-    # DUPLICATE PROTECTION
-    # --------------------------------------------------------
-
-    if not update.update_id:
+    if update.update_id is None:
         return
 
-    if not claim_update(update.update_id):
-
+    if not claim_update(
+        update.update_id
+    ):
         print(
             f"Ignored duplicate update "
             f"{update.update_id}"
         )
-
         return
 
     message = update.message
@@ -360,27 +294,19 @@ async def handle_video(
     if not message:
         return
 
-    video = message.video
-
-    if not video:
+    if not message.video:
         return
 
-    # --------------------------------------------------------
-    # QUEUE POSITION
-    # --------------------------------------------------------
+    video = message.video
 
+    # Current queue size + current video
     position = video_queue.qsize() + 1
 
     status = await message.reply_text(
         "📥 Added to queue\n\n"
         f"📋 Position: {position}\n"
-        "⏳ Waiting...",
-        reply_markup=MAIN_MENU,
+        "⏳ Waiting..."
     )
-
-    # --------------------------------------------------------
-    # CREATE JOB
-    # --------------------------------------------------------
 
     job = VideoJob(
         chat_id=message.chat_id,
@@ -389,25 +315,22 @@ async def handle_video(
         status_message_id=status.message_id,
     )
 
-    # --------------------------------------------------------
-    # ADD TO QUEUE
-    # --------------------------------------------------------
-
     await video_queue.put(job)
 
     print(
         f"Video queued | "
-        f"chat={job.chat_id} | "
         f"message={job.message_id} | "
         f"queue={video_queue.qsize()}"
     )
 
 
 # ============================================================
-# GET DURATION
+# GET VIDEO DURATION
 # ============================================================
 
-async def get_duration(file_path):
+async def get_duration(
+    file_path
+):
 
     if not FFPROBE:
         return None
@@ -425,16 +348,19 @@ async def get_duration(file_path):
         stderr=asyncio.subprocess.PIPE,
     )
 
-    stdout, stderr = await process.communicate()
+    stdout, _ = await process.communicate()
 
     if process.returncode != 0:
         return None
 
     try:
+
         return float(
             stdout.decode().strip()
         )
+
     except Exception:
+
         return None
 
 
@@ -442,7 +368,9 @@ async def get_duration(file_path):
 # PROCESS VIDEO
 # ============================================================
 
-async def process_video_job(job: VideoJob):
+async def process_video_job(
+    job: VideoJob
+):
 
     bot = application.bot
 
@@ -474,7 +402,7 @@ async def process_video_job(job: VideoJob):
             text=(
                 "📥 Downloading video...\n\n"
                 "0%"
-            ),
+            )
         )
 
         telegram_file = await bot.get_file(
@@ -492,7 +420,7 @@ async def process_video_job(job: VideoJob):
                 "📥 Download complete\n\n"
                 "🎬 Preparing conversion...\n\n"
                 "0%"
-            ),
+            )
         )
 
         # ----------------------------------------------------
@@ -510,7 +438,7 @@ async def process_video_job(job: VideoJob):
             )
 
         # ----------------------------------------------------
-        # CHECK FFMPEG
+        # FFMPEG CHECK
         # ----------------------------------------------------
 
         if not FFMPEG:
@@ -531,9 +459,11 @@ async def process_video_job(job: VideoJob):
             "-i",
             input_file,
 
+            # Maximum 8 seconds
             "-t",
             "8",
 
+            # 720x1280 / 9:16
             "-vf",
             (
                 "scale=720:1280:"
@@ -541,9 +471,11 @@ async def process_video_job(job: VideoJob):
                 "crop=720:1280"
             ),
 
+            # 30 FPS
             "-r",
             "30",
 
+            # H.264
             "-c:v",
             "libx264",
 
@@ -556,6 +488,7 @@ async def process_video_job(job: VideoJob):
             "-pix_fmt",
             "yuv420p",
 
+            # Video bitrate
             "-b:v",
             "2200k",
 
@@ -565,6 +498,7 @@ async def process_video_job(job: VideoJob):
             "-bufsize",
             "5000k",
 
+            # Audio
             "-c:a",
             "aac",
 
@@ -574,9 +508,11 @@ async def process_video_job(job: VideoJob):
             "-ar",
             "48000",
 
+            # Web playback
             "-movflags",
             "+faststart",
 
+            # Progress
             "-progress",
             "pipe:1",
 
@@ -619,15 +555,13 @@ async def process_video_job(job: VideoJob):
 
                 try:
 
-                    out_time_ms = int(
-                        line.split(
-                            "=",
-                            1
-                        )[1]
-                    )
-
                     out_seconds = (
-                        out_time_ms
+                        int(
+                            line.split(
+                                "=",
+                                1
+                            )[1]
+                        )
                         / 1_000_000
                     )
 
@@ -642,7 +576,7 @@ async def process_video_job(job: VideoJob):
                                         duration,
                                         8
                                     )
-                                ) * 100,
+                                ) * 100
                             )
                         )
 
@@ -654,7 +588,6 @@ async def process_video_job(job: VideoJob):
                         percent != last_percent
                         and (
                             percent == 0
-                            or percent == 100
                             or percent % 5 == 0
                         )
                     ):
@@ -668,7 +601,7 @@ async def process_video_job(job: VideoJob):
                                 "🎬 Converting...\n\n"
                                 f"{progress_bar(percent)} "
                                 f"{percent}%"
-                            ),
+                            )
                         )
 
                 except Exception:
@@ -681,7 +614,6 @@ async def process_video_job(job: VideoJob):
         if return_code != 0:
 
             print(
-                "FFmpeg error:",
                 stderr.decode(
                     errors="ignore"
                 )
@@ -738,7 +670,7 @@ async def process_video_job(job: VideoJob):
                 "✅ Conversion complete\n\n"
                 "📤 Uploading...\n\n"
                 "100%"
-            ),
+            )
         )
 
         with open(
@@ -756,7 +688,7 @@ async def process_video_job(job: VideoJob):
                     int(duration)
                     if duration
                     else 8,
-                    8,
+                    8
                 ),
                 caption=(
                     "🎬 Snapchat Preview Ready\n\n"
@@ -780,14 +712,14 @@ async def process_video_job(job: VideoJob):
         )
 
         # ----------------------------------------------------
-        # DELETE STATUS
+        # REMOVE STATUS MESSAGE
         # ----------------------------------------------------
 
         try:
 
             await bot.delete_message(
                 chat_id=job.chat_id,
-                message_id=job.status_message_id,
+                message_id=job.status_message_id
             )
 
         except Exception:
@@ -799,7 +731,7 @@ async def process_video_job(job: VideoJob):
             f"Job failed: {repr(e)}"
         )
 
-        # Don't display a failure if the video
+        # Don't show an error if the video
         # was already successfully sent.
 
         if not video_sent:
@@ -812,15 +744,11 @@ async def process_video_job(job: VideoJob):
                     text=(
                         "❌ Conversion failed\n\n"
                         f"{str(e)}"
-                    ),
+                    )
                 )
 
-            except Exception as edit_error:
-
-                print(
-                    f"Could not show error: "
-                    f"{edit_error}"
-                )
+            except Exception:
+                pass
 
     finally:
 
@@ -845,11 +773,6 @@ async def queue_worker():
         job = await video_queue.get()
 
         try:
-
-            print(
-                f"Processing video | "
-                f"message={job.message_id}"
-            )
 
             await process_video_job(
                 job
@@ -891,7 +814,9 @@ async def health(request):
 # TELEGRAM WEBHOOK
 # ============================================================
 
-async def telegram_webhook(request):
+async def telegram_webhook(
+    request
+):
 
     try:
 
@@ -902,8 +827,6 @@ async def telegram_webhook(request):
             application.bot
         )
 
-        # Process in background.
-        # Telegram gets a fast 200 response.
         asyncio.create_task(
             application.process_update(
                 update
@@ -927,7 +850,7 @@ async def telegram_webhook(request):
 
 
 # ============================================================
-# RAILWAY / RENDER SERVER
+# RAILWAY SERVER
 # ============================================================
 
 async def run_server():
@@ -935,14 +858,17 @@ async def run_server():
     global queue_worker_task
 
     print(
-        "🚀 Starting web server..."
+        "🚀 Starting Railway server..."
     )
 
     await application.initialize()
 
     await application.start()
 
-    # Start queue worker.
+    # Set Telegram command menu
+    await setup_commands()
+
+    # Start ONE queue worker
     queue_worker_task = asyncio.create_task(
         queue_worker()
     )
@@ -951,26 +877,18 @@ async def run_server():
     # WEBHOOK
     # --------------------------------------------------------
 
-    if PUBLIC_URL:
+    webhook_url = (
+        f"{PUBLIC_URL}/telegram"
+    )
 
-        webhook_url = (
-            f"{PUBLIC_URL}/telegram"
-        )
+    print(
+        f"Setting Telegram webhook: "
+        f"{webhook_url}"
+    )
 
-        print(
-            f"Setting webhook: "
-            f"{webhook_url}"
-        )
-
-        await application.bot.set_webhook(
-            url=webhook_url
-        )
-
-    else:
-
-        print(
-            "WARNING: No public URL found."
-        )
+    await application.bot.set_webhook(
+        url=webhook_url
+    )
 
     # --------------------------------------------------------
     # WEB SERVER
@@ -1008,8 +926,7 @@ async def run_server():
     await site.start()
 
     print(
-        f"🌐 Server running on "
-        f"port {PORT}"
+        f"🌐 Server running on port {PORT}"
     )
 
     try:
@@ -1032,6 +949,7 @@ async def run_server():
 
             try:
                 await queue_worker_task
+
             except asyncio.CancelledError:
                 pass
 
@@ -1051,18 +969,22 @@ async def run_local():
     global queue_worker_task
 
     print(
-        "💻 Running locally..."
+        "💻 Running locally with polling..."
     )
 
     await application.initialize()
 
     await application.start()
 
-    # Remove webhook so polling works.
+    # Set Telegram command menu
+    await setup_commands()
+
+    # Remove webhook when running locally
     await application.bot.delete_webhook(
         drop_pending_updates=False
     )
 
+    # Start queue worker
     queue_worker_task = asyncio.create_task(
         queue_worker()
     )
@@ -1093,6 +1015,7 @@ async def run_local():
 
             try:
                 await queue_worker_task
+
             except asyncio.CancelledError:
                 pass
 
@@ -1135,14 +1058,6 @@ application.add_handler(
     )
 )
 
-application.add_handler(
-    MessageHandler(
-        filters.TEXT
-        & ~filters.COMMAND,
-        menu_handler
-    )
-)
-
 
 # ============================================================
 # MAIN
@@ -1150,17 +1065,14 @@ application.add_handler(
 
 if __name__ == "__main__":
 
-    # If a public URL is configured,
-    # run webhook mode.
-    #
-    # Otherwise run polling locally.
-
+    # Railway webhook mode
     if PUBLIC_URL:
 
         asyncio.run(
             run_server()
         )
 
+    # Local polling mode
     else:
 
         asyncio.run(
