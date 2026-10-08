@@ -3,6 +3,8 @@ import asyncio
 import tempfile
 import shutil
 import time
+from dataclasses import dataclass
+from collections import OrderedDict
 from pathlib import Path
 
 from aiohttp import web
@@ -19,110 +21,81 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 
-# =========================================================
+# ============================================================
 # CONFIG
-# =========================================================
+# ============================================================
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", "10000"))
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN is missing. "
-        "Add it to your .env file or Render environment variables."
-    )
-
-PORT = int(os.getenv("PORT", "10000"))
-
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+    raise RuntimeError("BOT_TOKEN is missing")
 
 
-# =========================================================
+# ============================================================
 # FFMPEG
-# =========================================================
+# ============================================================
 
 def find_ffmpeg():
+    path = shutil.which("ffmpeg")
 
-    # Normal PATH
-    ffmpeg = shutil.which("ffmpeg")
+    if path:
+        return path
 
-    if ffmpeg:
-        print(f"FFmpeg found: {ffmpeg}")
-        return ffmpeg
+    possible_paths = [
+        r"C:\Users\USER\AppData\Local\Microsoft\WinGet\Packages"
+    ]
 
-    # Windows WinGet
-    local_app_data = os.environ.get(
-        "LOCALAPPDATA",
-        ""
-    )
+    for base in possible_paths:
+        base_path = Path(base)
 
-    winget_path = (
-        Path(local_app_data)
-        / "Microsoft"
-        / "WinGet"
-        / "Packages"
-    )
+        if base_path.exists():
+            matches = list(base_path.rglob("ffmpeg.exe"))
 
-    if winget_path.exists():
+            if matches:
+                return str(matches[0])
 
-        matches = list(
-            winget_path.glob(
-                "Gyan.FFmpeg*/**/bin/ffmpeg.exe"
-            )
-        )
+    return None
 
-        if matches:
 
-            ffmpeg = str(matches[0])
+def find_ffprobe():
+    path = shutil.which("ffprobe")
 
-            print(
-                f"FFmpeg found through WinGet: {ffmpeg}"
-            )
+    if path:
+        return path
 
-            return ffmpeg
+    possible_paths = [
+        r"C:\Users\USER\AppData\Local\Microsoft\WinGet\Packages"
+    ]
+
+    for base in possible_paths:
+        base_path = Path(base)
+
+        if base_path.exists():
+            matches = list(base_path.rglob("ffprobe.exe"))
+
+            if matches:
+                return str(matches[0])
 
     return None
 
 
 FFMPEG = find_ffmpeg()
+FFPROBE = find_ffprobe()
 
 if not FFMPEG:
     print("WARNING: FFmpeg was not found.")
-else:
-    print(f"Using FFmpeg: {FFMPEG}")
+
+if not FFPROBE:
+    print("WARNING: FFprobe was not found.")
 
 
-# =========================================================
-# FFPROBE
-# =========================================================
-
-def find_ffprobe():
-
-    ffprobe = shutil.which("ffprobe")
-
-    if ffprobe:
-        return ffprobe
-
-    if FFMPEG:
-
-        possible = (
-            Path(FFMPEG).parent
-            / "ffprobe.exe"
-        )
-
-        if possible.exists():
-            return str(possible)
-
-    return None
-
-
-FFPROBE = find_ffprobe()
-
-
-# =========================================================
-# TELEGRAM REQUEST
-# =========================================================
+# ============================================================
+# TELEGRAM APPLICATION
+# ============================================================
 
 request = HTTPXRequest(
     connect_timeout=30,
@@ -131,350 +104,325 @@ request = HTTPXRequest(
     pool_timeout=30,
 )
 
-
-# =========================================================
-# APPLICATION
-# =========================================================
-
 application = (
-    Application
-    .builder()
+    Application.builder()
     .token(BOT_TOKEN)
     .request(request)
     .build()
 )
 
 
-# =========================================================
-# TRACK CURRENT JOBS
-#
-# Prevents the same Telegram update from being processed
-# twice.
-# =========================================================
+# ============================================================
+# VIDEO QUEUE
+# ============================================================
 
-active_jobs = set()
+video_queue = asyncio.Queue()
+
+# Only ONE FFmpeg conversion at a time.
+# This is important for Render Free.
+queue_worker_task = None
+
+# Prevent duplicate Telegram webhook deliveries.
+seen_updates = OrderedDict()
+
+MAX_SEEN_UPDATES = 5000
 
 
-# =========================================================
-# SAFE TELEGRAM MESSAGE EDIT
-# =========================================================
+@dataclass
+class VideoJob:
+    chat_id: int
+    message_id: int
+    file_id: str
+    status_message_id: int
 
-async def safe_edit(message, text):
 
-    try:
+# ============================================================
+# DUPLICATE PROTECTION
+# ============================================================
 
-        await message.edit_text(text)
+def claim_update(update_id: int) -> bool:
+    """
+    Returns True if this update is new.
+    Returns False if we've already handled it.
+    """
 
-        return True
-
-    except Exception as error:
-
-        print(
-            "Telegram message update failed:",
-            repr(error)
-        )
-
+    if update_id in seen_updates:
         return False
 
+    seen_updates[update_id] = time.time()
 
-# =========================================================
-# SAFE DELETE
-# =========================================================
+    # Keep memory under control.
+    while len(seen_updates) > MAX_SEEN_UPDATES:
+        seen_updates.popitem(last=False)
+
+    return True
+
+
+# ============================================================
+# SAFE TELEGRAM HELPERS
+# ============================================================
+
+async def safe_edit(message, text):
+    try:
+        await message.edit_text(text)
+    except Exception as e:
+        print(f"Could not edit message: {e}")
+
 
 async def safe_delete(message):
-
     try:
-
         await message.delete()
-
-    except Exception as error:
-
-        # This should NEVER make a successful conversion
-        # look like a failed conversion.
-        print(
-            "Could not delete status message:",
-            repr(error)
-        )
+    except Exception as e:
+        print(f"Could not delete message: {e}")
 
 
-# =========================================================
-# /START
-# =========================================================
+# ============================================================
+# PROGRESS BAR
+# ============================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+def progress_bar(percent: int, width: int = 10):
+    percent = max(0, min(100, percent))
 
-    if not update.message:
-        return
+    filled = int(width * percent / 100)
+    empty = width - filled
+
+    return "█" * filled + "░" * empty
+
+
+# ============================================================
+# START COMMAND
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
-        "👋 Welcome to Snapchat Preview Maker!\n\n"
-
+        "🎬 Snapchat Preview Maker\n\n"
         "Send me a video and I'll convert it to:\n\n"
-
-        "📱 720 × 1280\n"
-        "📐 9:16\n"
-        "🎬 Maximum 8 seconds\n"
-        "🎥 MP4 / H.264\n\n"
-
-        "Just send your video."
+        "• 720 × 1280\n"
+        "• 9:16\n"
+        "• Maximum 8 seconds\n"
+        "• MP4 / H.264\n"
+        "• Under 32 MB\n\n"
+        "You can send multiple videos.\n"
+        "They'll be processed one at a time."
     )
 
 
-# =========================================================
-# VIDEO DURATION
-# =========================================================
+# ============================================================
+# QUEUE COMMAND
+# ============================================================
 
-async def get_video_duration(input_path):
+async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    if not FFPROBE:
-        return 8.0
+    size = video_queue.qsize()
 
-    command = [
-        FFPROBE,
-
-        "-v",
-        "error",
-
-        "-show_entries",
-        "format=duration",
-
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-
-        str(input_path),
-    ]
-
-    try:
-
-        process = await asyncio.create_subprocess_exec(
-            *command,
-
-            stdout=asyncio.subprocess.PIPE,
-
-            stderr=asyncio.subprocess.PIPE,
+    if size == 0:
+        await update.message.reply_text(
+            "📭 The processing queue is empty."
+        )
+    else:
+        await update.message.reply_text(
+            f"📋 Videos waiting in queue: {size}"
         )
 
-        stdout, _ = await process.communicate()
 
-        if process.returncode != 0:
-            return 8.0
+# ============================================================
+# VIDEO HANDLER
+# ============================================================
 
-        duration = float(
-            stdout.decode().strip()
-        )
-
-        return max(
-            0.1,
-            min(duration, 8.0)
-        )
-
-    except Exception:
-
-        return 8.0
-
-
-# =========================================================
-# PROGRESS BAR
-# =========================================================
-
-def make_progress_bar(percent):
-
-    percent = max(
-        0,
-        min(100, int(percent))
-    )
-
-    filled = int(
-        percent / 10
-    )
-
-    return (
-        "█" * filled
-        + "░" * (10 - filled)
-    )
-
-
-# =========================================================
-# UPDATE PROGRESS
-# =========================================================
-
-async def update_progress(
-    status,
-    percent,
-    last_update
-):
-
-    now = time.monotonic()
-
-    # Update at most every 1.5 seconds
-    if (
-        now - last_update[0] < 1.5
-        and percent < 100
-    ):
-        return
-
-    percent = max(
-        0,
-        min(100, int(percent))
-    )
-
-    bar = make_progress_bar(
-        percent
-    )
-
-    text = (
-        "⚙️ Converting video...\n\n"
-
-        f"{bar} {percent}%\n\n"
-
-        "📱 720 × 1280\n"
-        "📐 9:16\n"
-        "🎬 Maximum 8 seconds"
-    )
-
-    if await safe_edit(
-        status,
-        text
-    ):
-
-        last_update[0] = now
-
-
-# =========================================================
-# PROCESS VIDEO
-# =========================================================
-
-async def process_video(
+async def handle_video(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
+    # --------------------------------------------------------
+    # DUPLICATE UPDATE PROTECTION
+    # --------------------------------------------------------
+
+    if not update.update_id:
+        return
+
+    if not claim_update(update.update_id):
+        print(
+            f"Ignored duplicate Telegram update: "
+            f"{update.update_id}"
+        )
+        return
 
     message = update.message
 
-    if not message or not message.video:
+    if not message:
         return
 
-    # =====================================================
-    # DUPLICATE PROTECTION
-    # =====================================================
+    video = message.video
 
-    job_id = (
-        update.update_id
-        if update.update_id is not None
-        else message.message_id
-    )
-
-    if job_id in active_jobs:
-
-        print(
-            f"Ignoring duplicate update: {job_id}"
-        )
-
+    if not video:
         return
 
-    active_jobs.add(job_id)
+    # --------------------------------------------------------
+    # QUEUE POSITION
+    # --------------------------------------------------------
 
-    # =====================================================
-    # FFMPEG CHECK
-    # =====================================================
+    position = video_queue.qsize() + 1
 
-    if not FFMPEG:
-
-        await message.reply_text(
-            "❌ FFmpeg is not available."
-        )
-
-        active_jobs.discard(job_id)
-
-        return
-
-    temp_dir = Path(
-        tempfile.gettempdir()
+    status = await message.reply_text(
+        "📥 Added to processing queue\n\n"
+        f"📋 Position: {position}\n"
+        "⏳ Waiting..."
     )
 
-    input_path = (
-        temp_dir
-        / f"snap_input_{message.message_id}.mp4"
+    # --------------------------------------------------------
+    # CREATE JOB
+    # --------------------------------------------------------
+
+    job = VideoJob(
+        chat_id=message.chat_id,
+        message_id=message.message_id,
+        file_id=video.file_id,
+        status_message_id=status.message_id,
     )
 
-    output_path = (
-        temp_dir
-        / f"snap_output_{message.message_id}.mp4"
+    # --------------------------------------------------------
+    # ADD TO QUEUE
+    # --------------------------------------------------------
+
+    await video_queue.put(job)
+
+    print(
+        f"Video queued | "
+        f"chat={job.chat_id} | "
+        f"message={job.message_id} | "
+        f"queue={video_queue.qsize()}"
     )
+
+
+# ============================================================
+# GET VIDEO DURATION
+# ============================================================
+
+async def get_duration(file_path):
+
+    if not FFPROBE:
+        return None
+
+    process = await asyncio.create_subprocess_exec(
+        FFPROBE,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        file_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        return None
+
+    try:
+        return float(stdout.decode().strip())
+    except Exception:
+        return None
+
+
+# ============================================================
+# PROCESS VIDEO
+# ============================================================
+
+async def process_video_job(job: VideoJob):
+
+    bot = application.bot
 
     status = None
 
-    # This becomes True ONLY after the final video
-    # has been successfully handed to Telegram.
+    temp_dir = tempfile.mkdtemp(prefix="snapchat_video_")
+
+    input_file = os.path.join(
+        temp_dir,
+        "input_video"
+    )
+
+    output_file = os.path.join(
+        temp_dir,
+        "snapchat_preview.mp4"
+    )
+
     video_sent = False
 
     try:
 
-        # =================================================
-        # STATUS
-        # =================================================
+        # ----------------------------------------------------
+        # GET STATUS MESSAGE
+        # ----------------------------------------------------
 
-        status = await message.reply_text(
-            "📥 Downloading video...\n\n"
-            "0%"
-        )
+        try:
+            status = await bot.edit_message_text(
+                chat_id=job.chat_id,
+                message_id=job.status_message_id,
+                text=(
+                    "📥 Downloading video...\n\n"
+                    "0%"
+                ),
+            )
+        except Exception:
+            status = None
 
-        # =================================================
+        # ----------------------------------------------------
         # DOWNLOAD
-        # =================================================
+        # ----------------------------------------------------
 
-        telegram_file = await context.bot.get_file(
-            message.video.file_id
-        )
+        telegram_file = await bot.get_file(job.file_id)
 
         await telegram_file.download_to_drive(
-            custom_path=str(input_path)
+            custom_path=input_file
         )
 
-        print(
-            "Video downloaded successfully."
-        )
+        if status:
 
-        # =================================================
-        # DURATION
-        # =================================================
+            await safe_edit(
+                status,
+                "📥 Download complete\n\n"
+                "Preparing conversion...\n\n"
+                "0%"
+            )
 
-        duration = await get_video_duration(
-            input_path
-        )
+        # ----------------------------------------------------
+        # CHECK DURATION
+        # ----------------------------------------------------
 
-        print(
-            f"Processing duration: {duration:.2f}s"
-        )
+        duration = await get_duration(input_file)
 
-        await safe_edit(
-            status,
-            "📥 Download complete!\n\n"
-            "⚙️ Preparing conversion...\n\n"
-            "0%"
-        )
+        if duration:
+            print(
+                f"Input duration: {duration:.2f}s"
+            )
 
-        # =================================================
+        # ----------------------------------------------------
         # FFMPEG
-        # =================================================
+        # ----------------------------------------------------
+
+        if not FFMPEG:
+            raise RuntimeError(
+                "FFmpeg is not installed."
+            )
 
         command = [
-
             FFMPEG,
 
             "-y",
 
             "-i",
-            str(input_path),
+            input_file,
 
             # Maximum 8 seconds
             "-t",
             "8",
 
-            # 720 x 1280 / 9:16
+            # 720x1280 / 9:16
             "-vf",
             (
                 "scale=720:1280:"
@@ -499,7 +447,7 @@ async def process_video(
             "-pix_fmt",
             "yuv420p",
 
-            # Keep file comfortably under 32 MB
+            # Keep output comfortably under 32MB
             "-b:v",
             "2200k",
 
@@ -519,37 +467,35 @@ async def process_video(
             "-ar",
             "48000",
 
-            # Web-friendly MP4
+            # Better playback
             "-movflags",
             "+faststart",
 
-            # Machine-readable progress
+            # Progress information
             "-progress",
             "pipe:1",
 
             "-nostats",
 
-            str(output_path),
+            output_file,
         ]
 
         print(
-            "Running FFmpeg..."
+            "Starting FFmpeg:",
+            " ".join(command)
         )
 
         process = await asyncio.create_subprocess_exec(
-
             *command,
-
             stdout=asyncio.subprocess.PIPE,
-
             stderr=asyncio.subprocess.PIPE,
         )
 
-        last_update = [0]
-
-        # =================================================
+        # ----------------------------------------------------
         # READ FFMPEG PROGRESS
-        # =================================================
+        # ----------------------------------------------------
+
+        last_percent = -1
 
         while True:
 
@@ -562,293 +508,281 @@ async def process_video(
                 errors="ignore"
             ).strip()
 
-            if line.startswith(
-                "out_time_ms="
-            ):
+            if line.startswith("out_time_ms="):
 
                 try:
-
-                    time_ms = int(
-                        line.split(
-                            "=",
-                            1
-                        )[1]
+                    out_time_ms = int(
+                        line.split("=", 1)[1]
                     )
 
-                    current_seconds = (
-                        time_ms / 1_000_000
+                    out_seconds = (
+                        out_time_ms / 1_000_000
                     )
 
-                    percent = (
-                        current_seconds
-                        / duration
-                    ) * 100
+                    if duration:
+                        percent = int(
+                            min(
+                                99,
+                                (
+                                    out_seconds
+                                    / min(duration, 8)
+                                )
+                                * 100,
+                            )
+                        )
+                    else:
+                        percent = 0
 
-                    percent = min(
-                        percent,
-                        99
-                    )
+                    # Only update when percentage changes
+                    # enough to matter.
+                    if (
+                        percent != last_percent
+                        and (
+                            percent == 0
+                            or percent == 100
+                            or percent % 5 == 0
+                        )
+                    ):
 
-                    await update_progress(
-                        status,
-                        percent,
-                        last_update
-                    )
+                        last_percent = percent
 
-                except Exception as error:
+                        if status:
 
-                    print(
-                        "Progress parsing error:",
-                        repr(error)
-                    )
+                            await safe_edit(
+                                status,
+                                (
+                                    "🎬 Converting...\n\n"
+                                    f"{progress_bar(percent)} "
+                                    f"{percent}%"
+                                ),
+                            )
 
-        # =================================================
-        # GET FFMPEG RESULT
-        # =================================================
+                except Exception:
+                    pass
 
         stderr = await process.stderr.read()
 
-        await process.wait()
+        return_code = await process.wait()
 
-        if process.returncode != 0:
-
-            error_text = stderr.decode(
-                errors="ignore"
-            )
+        if return_code != 0:
 
             print(
-                "FFMPEG ERROR:"
+                "FFmpeg error:",
+                stderr.decode(
+                    errors="ignore"
+                )
             )
 
-            print(
-                error_text
+            raise RuntimeError(
+                "FFmpeg conversion failed."
             )
 
-            await safe_edit(
-                status,
-                "❌ Conversion failed.\n\n"
-                "Please try another video."
+        # ----------------------------------------------------
+        # ENSURE OUTPUT EXISTS
+        # ----------------------------------------------------
+
+        if not os.path.exists(output_file):
+
+            raise RuntimeError(
+                "FFmpeg did not create an output file."
             )
 
-            return
-
-        # =================================================
-        # VERIFY OUTPUT
-        # =================================================
-
-        if not output_path.exists():
-
-            await safe_edit(
-                status,
-                "❌ Conversion failed.\n\n"
-                "FFmpeg did not create the output."
-            )
-
-            return
-
-        # =================================================
-        # 100%
-        # =================================================
-
-        await safe_edit(
-            status,
-            "⚙️ Converting video...\n\n"
-            "██████████ 100%\n\n"
-            "📱 720 × 1280\n"
-            "📐 9:16\n"
-            "🎬 Maximum 8 seconds"
-        )
-
-        await asyncio.sleep(
-            0.5
-        )
-
-        # =================================================
+        # ----------------------------------------------------
         # FILE SIZE
-        # =================================================
+        # ----------------------------------------------------
 
-        size_mb = (
-            output_path.stat().st_size
-            / (1024 * 1024)
+        file_size = os.path.getsize(
+            output_file
+        )
+
+        size_mb = file_size / (
+            1024 * 1024
         )
 
         print(
             f"Output size: {size_mb:.2f} MB"
         )
 
-        if size_mb > 32:
+        if file_size > 32 * 1024 * 1024:
 
-            await safe_edit(
-                status,
-                f"⚠️ Conversion complete, but "
-                f"the file is {size_mb:.1f} MB.\n\n"
-                "That's above the 32 MB limit."
+            raise RuntimeError(
+                "Output file is larger than 32 MB."
             )
 
-            return
-
-        # =================================================
+        # ----------------------------------------------------
         # UPLOAD
-        # =================================================
-
-        await safe_edit(
-            status,
-            "✅ Conversion complete!\n\n"
-            "100%\n\n"
-            f"📦 {size_mb:.1f} MB\n"
-            "⬆️ Uploading..."
-        )
-
-        try:
-
-            with open(
-                output_path,
-                "rb"
-            ) as video_file:
-
-                await message.reply_video(
-
-                    video=video_file,
-
-                    caption=(
-                        "✅ Snapchat Preview Ready\n\n"
-
-                        "🎬 8 seconds\n"
-                        "📱 720 × 1280\n"
-                        "📐 9:16\n"
-                        "🎥 MP4 / H.264"
-                    ),
-
-                    supports_streaming=True,
-
-                    read_timeout=180,
-
-                    write_timeout=180,
-
-                    connect_timeout=30,
-                )
-
-            # IMPORTANT:
-            # Only mark success AFTER Telegram accepts
-            # the video.
-            video_sent = True
-
-            print(
-                "Video successfully sent to Telegram."
-            )
-
-        except Exception as upload_error:
-
-            print(
-                "UPLOAD ERROR:",
-                repr(upload_error)
-            )
-
-            await safe_edit(
-                status,
-                "⚠️ Conversion completed, but "
-                "Telegram timed out while uploading.\n\n"
-                f"File size: {size_mb:.1f} MB"
-            )
-
-            return
-
-        # =================================================
-        # SUCCESS
-        # =================================================
-
-        if video_sent:
-
-            # Deleting the status message is OPTIONAL.
-            # If Telegram times out here, it must NOT turn
-            # the successful conversion into an error.
-            await safe_delete(
-                status
-            )
-
-            print(
-                "JOB COMPLETED SUCCESSFULLY."
-            )
-
-            return
-
-    # =====================================================
-    # GENERAL ERROR
-    # =====================================================
-
-    except Exception as error:
-
-        print(
-            "VIDEO PROCESSING ERROR:"
-        )
-
-        print(
-            repr(error)
-        )
-
-        # CRITICAL:
-        # If the video was already sent successfully,
-        # NEVER send "conversion failed".
-        if video_sent:
-
-            print(
-                "Ignoring error because video "
-                "was already successfully sent."
-            )
-
-            return
+        # ----------------------------------------------------
 
         if status:
 
             await safe_edit(
                 status,
-                "❌ Something went wrong "
-                "while processing the video."
+                (
+                    "✅ Conversion complete\n\n"
+                    "📤 Uploading...\n\n"
+                    "100%"
+                ),
             )
+
+        print(
+            f"Uploading video for chat {job.chat_id}"
+        )
+
+        with open(
+            output_file,
+            "rb"
+        ) as video_file:
+
+            await bot.send_video(
+                chat_id=job.chat_id,
+                video=video_file,
+                supports_streaming=True,
+                width=720,
+                height=1280,
+                duration=min(
+                    int(duration)
+                    if duration
+                    else 8,
+                    8,
+                ),
+                caption=(
+                    "🎬 Snapchat Preview Ready\n\n"
+                    "📐 720 × 1280\n"
+                    "📱 9:16\n"
+                    "⏱ Maximum 8 seconds\n"
+                    "🎞 MP4 / H.264"
+                ),
+                reply_to_message_id=job.message_id,
+                read_timeout=180,
+                write_timeout=180,
+                connect_timeout=30,
+                pool_timeout=30,
+            )
+
+        video_sent = True
+
+        print(
+            f"Video successfully sent for "
+            f"message {job.message_id}"
+        )
+
+        # ----------------------------------------------------
+        # DELETE STATUS MESSAGE
+        # ----------------------------------------------------
+
+        if status:
+
+            try:
+                await bot.delete_message(
+                    chat_id=job.chat_id,
+                    message_id=job.status_message_id,
+                )
+            except Exception:
+                pass
+
+    except Exception as e:
+
+        print(
+            f"Job failed: {repr(e)}"
+        )
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # If Telegram already received the video,
+        # DON'T send "Conversion failed".
+        # ----------------------------------------------------
+
+        if not video_sent:
+
+            try:
+
+                await bot.edit_message_text(
+                    chat_id=job.chat_id,
+                    message_id=job.status_message_id,
+                    text=(
+                        "❌ Conversion failed\n\n"
+                        f"{str(e)}"
+                    ),
+                )
+
+            except Exception as edit_error:
+
+                print(
+                    "Could not show error:",
+                    edit_error
+                )
 
     finally:
 
-        # =================================================
+        # ----------------------------------------------------
         # CLEANUP
-        # =================================================
+        # ----------------------------------------------------
 
         try:
-
-            input_path.unlink(
-                missing_ok=True
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True
             )
-
         except Exception:
             pass
 
+
+# ============================================================
+# QUEUE WORKER
+# ============================================================
+
+async def queue_worker():
+
+    print("Queue worker started.")
+
+    while True:
+
+        job = await video_queue.get()
+
         try:
 
-            output_path.unlink(
-                missing_ok=True
+            print(
+                f"Processing queued video | "
+                f"chat={job.chat_id} | "
+                f"message={job.message_id}"
             )
 
-        except Exception:
-            pass
+            await process_video_job(job)
 
-        active_jobs.discard(
-            job_id
-        )
+        except asyncio.CancelledError:
+
+            raise
+
+        except Exception as e:
+
+            print(
+                f"Unexpected queue error: {repr(e)}"
+            )
+
+        finally:
+
+            video_queue.task_done()
+
+            print(
+                f"Queue remaining: "
+                f"{video_queue.qsize()}"
+            )
 
 
-# =========================================================
+# ============================================================
 # HEALTH CHECK
-# =========================================================
+# ============================================================
 
 async def health(request):
 
     return web.Response(
-        text="Snapchat Preview Maker is running."
+        text="OK"
     )
 
 
-# =========================================================
-# WEBHOOK
-# =========================================================
+# ============================================================
+# TELEGRAM WEBHOOK
+# ============================================================
 
 async def telegram_webhook(request):
 
@@ -861,83 +795,71 @@ async def telegram_webhook(request):
             application.bot
         )
 
-        # IMPORTANT:
-        #
-        # Do NOT wait for FFmpeg here.
-        #
-        # Telegram needs the webhook response quickly.
-        # Processing the video in the background prevents
-        # Telegram from retrying the same update.
-        #
+        # Process in background so Telegram gets
+        # an immediate HTTP 200 response.
         asyncio.create_task(
-            application.process_update(
-                update
-            )
+            application.process_update(update)
         )
 
         return web.Response(
             text="OK"
         )
 
-    except Exception as error:
+    except Exception as e:
 
         print(
-            "WEBHOOK ERROR:",
-            repr(error)
+            f"Webhook error: {repr(e)}"
         )
 
+        # Still return 200 so Telegram doesn't
+        # repeatedly resend a malformed update.
         return web.Response(
-            status=500,
-            text="ERROR"
+            text="OK"
         )
 
 
-# =========================================================
-# RENDER
-# =========================================================
+# ============================================================
+# RENDER SERVER
+# ============================================================
 
 async def run_render():
 
-    print(
-        "Starting Render Web Service..."
-    )
+    global queue_worker_task
 
+    print("Starting Render server...")
+
+    # Initialize Telegram application
     await application.initialize()
 
     await application.start()
 
-    if not RENDER_EXTERNAL_URL:
+    # Start ONE queue worker
+    queue_worker_task = asyncio.create_task(
+        queue_worker()
+    )
 
-        raise RuntimeError(
-            "RENDER_EXTERNAL_URL is missing."
-        )
+    # --------------------------------------------------------
+    # WEBHOOK
+    # --------------------------------------------------------
 
     webhook_url = (
         f"{RENDER_EXTERNAL_URL}/telegram"
     )
 
     print(
-        f"Telegram webhook: {webhook_url}"
+        f"Setting Telegram webhook: "
+        f"{webhook_url}"
     )
 
     await application.bot.set_webhook(
         url=webhook_url
     )
 
-    print(
-        "Telegram webhook configured."
-    )
-
-    # =====================================================
+    # --------------------------------------------------------
     # HTTP SERVER
-    # =====================================================
+    # --------------------------------------------------------
 
     app = web.Application()
-
-    app.router.add_get(
-        "/",
-        health
-    )
 
     app.router.add_get(
         "/healthz",
@@ -949,9 +871,7 @@ async def run_render():
         telegram_webhook
     )
 
-    runner = web.AppRunner(
-        app
-    )
+    runner = web.AppRunner(app)
 
     await runner.setup()
 
@@ -967,43 +887,84 @@ async def run_render():
         f"Server running on port {PORT}"
     )
 
-    # Keep alive
-    while True:
+    # Keep process alive
+    try:
 
-        await asyncio.sleep(
-            3600
-        )
+        while True:
+
+            await asyncio.sleep(3600)
+
+    except asyncio.CancelledError:
+
+        pass
+
+    finally:
+
+        if queue_worker_task:
+
+            queue_worker_task.cancel()
+
+            try:
+                await queue_worker_task
+            except asyncio.CancelledError:
+                pass
+
+        await application.stop()
+
+        await application.shutdown()
+
+        await runner.cleanup()
 
 
-# =========================================================
-# LOCAL MODE
-# =========================================================
+# ============================================================
+# LOCAL POLLING
+# ============================================================
 
 async def run_local():
 
-    print(
-        "Starting local Telegram bot..."
-    )
+    global queue_worker_task
 
     print(
-        "Polling Telegram for messages."
+        "Running bot locally with polling..."
     )
 
     await application.initialize()
 
     await application.start()
 
+    # Remove webhook when testing locally.
+    await application.bot.delete_webhook(
+        drop_pending_updates=False
+    )
+
+    queue_worker_task = asyncio.create_task(
+        queue_worker()
+    )
+
     await application.updater.start_polling()
+
+    print("Bot is running.")
 
     try:
 
         while True:
 
-            await asyncio.sleep(
-                3600
-            )
+            await asyncio.sleep(3600)
+
+    except asyncio.CancelledError:
+
+        pass
 
     finally:
+
+        if queue_worker_task:
+
+            queue_worker_task.cancel()
+
+            try:
+                await queue_worker_task
+            except asyncio.CancelledError:
+                pass
 
         await application.updater.stop()
 
@@ -1012,9 +973,9 @@ async def run_local():
         await application.shutdown()
 
 
-# =========================================================
+# ============================================================
 # HANDLERS
-# =========================================================
+# ============================================================
 
 application.add_handler(
     CommandHandler(
@@ -1024,16 +985,23 @@ application.add_handler(
 )
 
 application.add_handler(
+    CommandHandler(
+        "queue",
+        queue_status
+    )
+)
+
+application.add_handler(
     MessageHandler(
         filters.VIDEO,
-        process_video
+        handle_video
     )
 )
 
 
-# =========================================================
-# START
-# =========================================================
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
 
